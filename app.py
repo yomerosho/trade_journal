@@ -27,52 +27,103 @@ st.set_page_config(
 
 TRADE_CODES = ["BTO", "STC", "BTC", "STO", "OEXP", "OASGN"]  # option open/close/expire/assign
 
-# GEX-Metrix-inspired dark palette
-GREEN = "#16c784"   # calls / profit
-RED = "#f6465d"     # puts / loss
-ACCENT = "#22d3ee"  # cyan accent
-PANEL = "#131722"
-PANEL_2 = "#1c2230"
-BORDER = "rgba(255,255,255,0.07)"
-MUTED = "#8b93a7"
-TEXT = "#e6e9ef"
+# --------------------------------------------------------------------------- #
+#  Themes — two palettes, switchable at runtime from the sidebar
+# --------------------------------------------------------------------------- #
+LIGHT = {
+    "app_bg": "#ffffff",
+    "panel": "#ffffff",
+    "panel_2": "#f7f7f9",
+    "border": "#e8e8ee",
+    "text": "#2b2b3a",
+    "muted": "#8a8a9e",
+    "green": "#1aa260",
+    "red": "#e2575b",
+    "accent": "#1aa260",
+    "green_rgb": "26,162,96",
+    "red_rgb": "226,87,91",
+    "cell_empty_bg": "#f4f4f6",
+    "cell_empty_border": "#ececf0",
+    "day_num": "#a0a0b0",
+    "amt_colored": False,        # light: charcoal amounts (bg signals win/loss)
+    "amt_text": "#1f2430",
+    "pill_bg": "#eceaf6",
+    "th_bg": "#ffffff",
+    "th_border": "#ececf0",
+    "shadow": "0 1px 2px rgba(0,0,0,0.03)",
+    "input_bg": "#ffffff",
+}
 
-GLOBAL_CSS = f"""
+# Softer dark — a comfortable slate, not near-black
+DARK = {
+    "app_bg": "#1c2030",
+    "panel": "#262b3a",
+    "panel_2": "#2e3447",
+    "border": "rgba(255,255,255,0.10)",
+    "text": "#e6e9ef",
+    "muted": "#9aa1b5",
+    "green": "#2bd49a",
+    "red": "#ff6b81",
+    "accent": "#2bd49a",
+    "green_rgb": "43,212,154",
+    "red_rgb": "255,107,129",
+    "cell_empty_bg": "#262b3a",
+    "cell_empty_border": "rgba(255,255,255,0.08)",
+    "day_num": "#7b8294",
+    "amt_colored": True,         # dark: colored amounts read better than charcoal
+    "amt_text": "#e6e9ef",
+    "pill_bg": "rgba(255,255,255,0.08)",
+    "th_bg": "#262b3a",
+    "th_border": "rgba(255,255,255,0.10)",
+    "shadow": "0 1px 2px rgba(0,0,0,0.20)",
+    "input_bg": "#262b3a",
+}
+
+
+def get_palette() -> dict:
+    return DARK if st.session_state.get("theme") == "Dark" else LIGHT
+
+
+def global_css(P: dict) -> str:
+    """Theme-aware global CSS, incl. overrides for Streamlit chrome so the
+    runtime toggle recolors the whole app (background, sidebar, inputs)."""
+    return f"""
 <style>
-  .stApp {{ background:#0b0e14; }}
-  /* Metric tiles */
-  div[data-testid="stMetric"] {{
-      background:{PANEL}; border:1px solid {BORDER}; border-radius:12px;
-      padding:14px 16px;
+  .stApp {{ background:{P['app_bg']}; }}
+  /* recolor core chrome so the toggle affects the whole page */
+  .stApp, .stApp p, .stApp label, .stApp span, .stApp h1, .stApp h2,
+  .stApp h3, .stApp h4 {{ color:{P['text']}; }}
+  section[data-testid="stSidebar"] {{ background:{P['panel_2']}; }}
+  div[data-baseweb="select"] > div {{
+      background:{P['input_bg']}; border-color:{P['border']}; color:{P['text']};
   }}
-  div[data-testid="stMetricLabel"] p {{
-      color:{MUTED}; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+  div[data-testid="stExpander"] {{
+      border:1px solid {P['border']}; border-radius:12px; background:{P['panel']};
   }}
-  div[data-testid="stMetricValue"] {{
-      font-variant-numeric:tabular-nums; font-weight:700;
-  }}
-  /* GEX-Metrix style top data strip */
+  hr {{ border-color:{P['border']}; }}
+  /* Summary strip */
   .gex-strip {{
-      display:flex; flex-wrap:wrap; gap:0; background:{PANEL};
-      border:1px solid {BORDER}; border-radius:12px; overflow:hidden;
+      display:flex; flex-wrap:wrap; gap:0; background:{P['panel']};
+      border:1px solid {P['border']}; border-radius:14px; overflow:hidden;
       margin-bottom:18px; font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+      box-shadow:{P['shadow']};
   }}
   .gex-cell {{
-      flex:1 1 14%; min-width:120px; padding:10px 16px;
-      border-right:1px solid {BORDER};
+      flex:1 1 14%; min-width:120px; padding:11px 16px;
+      border-right:1px solid {P['border']};
   }}
   .gex-cell:last-child {{ border-right:none; }}
-  .gex-cell .lbl {{ color:{MUTED}; font-size:10.5px; text-transform:uppercase;
+  .gex-cell .lbl {{ color:{P['muted']}; font-size:10.5px; text-transform:uppercase;
       letter-spacing:.07em; margin-bottom:3px; }}
   .gex-cell .val {{ font-size:18px; font-weight:700; font-variant-numeric:tabular-nums;
-      color:{TEXT}; }}
+      color:{P['text']}; }}
   h1,h2,h3,h4 {{ letter-spacing:-.01em; }}
 </style>
 """
 
 
 def gex_strip(items: list[tuple[str, str, str]]) -> str:
-    """Render a GEX-Metrix-style horizontal label/value strip.
+    """Render the horizontal label/value summary strip.
     items = [(label, value, color_hex_or_empty), ...]"""
     cells = ""
     for lbl, val, color in items:
@@ -235,20 +286,22 @@ def fmt_money(v: float, k: bool = True) -> str:
     return f"{sign}${a:,.0f}" if a >= 100 else f"{sign}${a:,.2f}"
 
 
-def day_color(pnl: float, max_abs: float) -> tuple[str, str, str]:
-    """Return (background, border, text_color) scaled by magnitude, dark-theme."""
+def day_color(pnl: float, max_abs: float, P: dict) -> tuple[str, str, str]:
+    """Return (background, border, text_color) scaled by magnitude for theme P."""
     if pnl == 0:
-        return "#131722", "rgba(255,255,255,0.06)", "#8b93a7"
-    intensity = 0.10 + 0.30 * min(abs(pnl) / max_abs, 1.0) if max_abs else 0.2
+        return P["cell_empty_bg"], P["cell_empty_border"], P["amt_text"]
+    intensity = 0.10 + 0.28 * min(abs(pnl) / max_abs, 1.0) if max_abs else 0.18
     if pnl > 0:
-        return f"rgba(22,199,132,{intensity:.2f})", "rgba(22,199,132,0.45)", GREEN
-    return f"rgba(246,70,93,{intensity:.2f})", "rgba(246,70,93,0.45)", RED
+        txt = P["green"] if P["amt_colored"] else P["amt_text"]
+        return f"rgba({P['green_rgb']},{intensity:.2f})", f"rgba({P['green_rgb']},0.40)", txt
+    txt = P["red"] if P["amt_colored"] else P["amt_text"]
+    return f"rgba({P['red_rgb']},{intensity:.2f})", f"rgba({P['red_rgb']},0.40)", txt
 
 
 # --------------------------------------------------------------------------- #
 #  Calendar rendering
 # --------------------------------------------------------------------------- #
-def render_calendar(year: int, month: int, daily: pd.DataFrame) -> str:
+def render_calendar(year: int, month: int, daily: pd.DataFrame, P: dict) -> str:
     """Build an HTML calendar grid styled like a trading-journal calendar."""
     stats = {
         r["date"].day: r
@@ -261,18 +314,18 @@ def render_calendar(year: int, month: int, daily: pd.DataFrame) -> str:
     weeks = calendar.monthcalendar(year, month)
     dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    css = """
+    css = f"""
     <style>
-    .cal { width:100%; border-collapse:separate; border-spacing:6px; font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
-    .cal th { color:#8b93a7; font-weight:600; font-size:12px; text-transform:uppercase;
-              letter-spacing:.06em; padding:6px 0; }
-    .cell { border-radius:10px; padding:8px 10px; height:80px; vertical-align:top;
-            border:1px solid rgba(255,255,255,0.06); background:#131722; position:relative; }
-    .cell .dnum { position:absolute; top:6px; right:9px; font-size:11px; color:#6b7280; }
-    .cell .pnl  { font-size:17px; font-weight:700; margin-top:16px;
-                  font-variant-numeric:tabular-nums; }
-    .cell .sub  { font-size:11px; color:#8b93a7; line-height:1.35; }
-    .empty { background:transparent; border:none; }
+    .cal {{ width:100%; border-collapse:separate; border-spacing:6px; font-family:-apple-system,Segoe UI,Roboto,sans-serif; }}
+    .cal th {{ color:{P['muted']}; font-weight:600; font-size:12px; padding:8px 0;
+              background:{P['th_bg']}; border:1px solid {P['th_border']}; border-radius:8px; }}
+    .cell {{ border-radius:10px; padding:8px 10px; height:80px; vertical-align:top;
+            border:1px solid {P['cell_empty_border']}; background:{P['cell_empty_bg']}; position:relative; }}
+    .cell .dnum {{ position:absolute; top:6px; right:9px; font-size:11px; color:{P['day_num']}; }}
+    .cell .pnl  {{ font-size:17px; font-weight:700; margin-top:16px; color:{P['amt_text']};
+                  font-variant-numeric:tabular-nums; }}
+    .cell .sub  {{ font-size:11px; color:{P['muted']}; line-height:1.35; }}
+    .empty {{ background:transparent; border:none; }}
     </style>
     """
 
@@ -285,7 +338,7 @@ def render_calendar(year: int, month: int, daily: pd.DataFrame) -> str:
                 continue
             if day in stats:
                 s = stats[day]
-                bg, border, txt = day_color(s["pnl"], max_abs)
+                bg, border, txt = day_color(s["pnl"], max_abs, P)
                 html += (
                     f"<td class='cell' style='background:{bg};border-color:{border}'>"
                     f"<div class='dnum'>{day}</div>"
@@ -323,10 +376,18 @@ def weekly_summary(year: int, month: int, daily: pd.DataFrame) -> list[dict]:
 #  Main app
 # --------------------------------------------------------------------------- #
 def main():
-    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+    P = get_palette()
+    st.markdown(global_css(P), unsafe_allow_html=True)
     st.title("📈 0DTE Trade Journal")
 
     with st.sidebar:
+        st.radio(
+            "Theme",
+            ["Light", "Dark"],
+            key="theme",
+            horizontal=True,
+        )
+        st.divider()
         st.header("Upload activity")
         st.caption(
             "Drop in your Robinhood **Account → Statements & history → "
@@ -340,7 +401,9 @@ def main():
             accept_multiple_files=True,
         )
         if st.button("🚪 Log out"):
+            keep = {"theme": st.session_state.get("theme")}
             st.session_state.clear()
+            st.session_state.update(keep)
             st.rerun()
 
     if not files:
@@ -379,7 +442,7 @@ def main():
     avg_day = total / n_days if n_days else 0
     best = mdaily.loc[mdaily["pnl"].idxmax()] if n_days else None
     worst = mdaily.loc[mdaily["pnl"].idxmin()] if n_days else None
-    pnl_color = GREEN if total >= 0 else RED
+    pnl_color = P["green"] if total >= 0 else P["red"]
 
     st.markdown(
         gex_strip(
@@ -389,16 +452,16 @@ def main():
                 ("Trading Days", str(n_days), ""),
                 ("Total Trades", str(n_trades), ""),
                 ("Green Days", f"{green_days}/{n_days}", ""),
-                ("Avg / Day", fmt_money(avg_day, k=False), GREEN if avg_day >= 0 else RED),
+                ("Avg / Day", fmt_money(avg_day, k=False), P["green"] if avg_day >= 0 else P["red"]),
                 (
                     "Best Day",
                     f"{fmt_money(best['pnl'])} · {best['date'].strftime('%-m/%-d')}" if best is not None else "—",
-                    GREEN,
+                    P["green"],
                 ),
                 (
                     "Worst Day",
                     f"{fmt_money(worst['pnl'])} · {worst['date'].strftime('%-m/%-d')}" if worst is not None else "—",
-                    RED,
+                    P["red"],
                 ),
             ]
         ),
@@ -409,20 +472,21 @@ def main():
     left, right = st.columns([4, 1])
     with left:
         st.markdown(f"#### {calendar.month_name[month]} {year}")
-        st.markdown(render_calendar(year, month, daily), unsafe_allow_html=True)
+        st.markdown(render_calendar(year, month, daily, P), unsafe_allow_html=True)
     with right:
         st.markdown("#### Weekly")
         for w in weekly_summary(year, month, daily):
-            color = GREEN if w["pnl"] >= 0 else RED
+            color = P["green"] if w["pnl"] >= 0 else P["red"]
             st.markdown(
-                f"<div style='border:1px solid {BORDER};border-radius:10px;"
-                f"background:{PANEL};padding:10px 12px;margin-bottom:8px;'>"
-                f"<div style='font-size:11px;color:{MUTED};text-transform:uppercase;"
-                f"letter-spacing:.06em;'>Week {w['week']}</div>"
-                f"<div style='font-size:20px;font-weight:700;color:{color};"
-                f"font-variant-numeric:tabular-nums;'>{fmt_money(w['pnl'])}</div>"
-                f"<div style='font-size:11px;color:{MUTED};'>{w['days']} day"
-                f"{'s' if w['days']!=1 else ''}</div></div>",
+                f"<div style='border:1px solid {P['border']};border-radius:12px;"
+                f"background:{P['panel']};padding:11px 14px;margin-bottom:9px;"
+                f"box-shadow:{P['shadow']};'>"
+                f"<div style='font-size:12px;color:{P['muted']};font-weight:600;'>Week {w['week']}</div>"
+                f"<div style='font-size:21px;font-weight:700;color:{color};"
+                f"font-variant-numeric:tabular-nums;margin:2px 0 6px;'>{fmt_money(w['pnl'])}</div>"
+                f"<span style='font-size:11px;color:{P['muted']};background:{P['pill_bg']};"
+                f"border-radius:20px;padding:2px 10px;'>{w['days']} day"
+                f"{'s' if w['days']!=1 else ''}</span></div>",
                 unsafe_allow_html=True,
             )
 
@@ -432,7 +496,7 @@ def main():
     st.markdown("#### Cumulative P&L (selected month)")
     curve = mdaily.copy()
     curve["cumulative"] = curve["pnl"].cumsum()
-    st.line_chart(curve.set_index("date")["cumulative"], height=260, color=ACCENT)
+    st.line_chart(curve.set_index("date")["cumulative"], height=260, color=P["accent"])
 
     # ---- Detail table ------------------------------------------------------
     with st.expander("📋 Daily detail"):
