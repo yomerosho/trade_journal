@@ -1,5 +1,5 @@
 """
-Trade Journal — Streamlit app
+0DTE Trade Journal — Streamlit app
 ----------------------------------
 Calendar-style trading journal that ingests Robinhood-style brokerage
 activity CSV exports and computes daily P&L, trade counts, and win rates.
@@ -19,7 +19,7 @@ import streamlit as st
 #  Page config
 # --------------------------------------------------------------------------- #
 st.set_page_config(
-    page_title="Trade Journal",
+    page_title="0DTE Trade Journal",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -160,7 +160,7 @@ def check_password() -> bool:
     st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 1.2, 1])
     with c2:
-        st.markdown("## 📈 Trade Journal")
+        st.markdown("## 📈 0DTE Trade Journal")
         st.caption("Private — authorized access only.")
         st.text_input("Password", type="password", on_change=password_entered, key="password")
         if st.session_state.get("password_missing"):
@@ -378,7 +378,7 @@ def weekly_summary(year: int, month: int, daily: pd.DataFrame) -> list[dict]:
 def main():
     P = get_palette()
     st.markdown(global_css(P), unsafe_allow_html=True)
-    st.title("📈 Trade Journal")
+    st.title("📈 0DTE Trade Journal")
 
     with st.sidebar:
         st.radio(
@@ -456,12 +456,12 @@ def main():
                 (
                     "Best Day",
                     f"{fmt_money(best['pnl'])} · {best['date'].strftime('%-m/%-d')}" if best is not None else "—",
-                    P["green"],
+                    (P["green"] if best["pnl"] >= 0 else P["red"]) if best is not None else "",
                 ),
                 (
                     "Worst Day",
                     f"{fmt_money(worst['pnl'])} · {worst['date'].strftime('%-m/%-d')}" if worst is not None else "—",
-                    P["red"],
+                    (P["green"] if worst["pnl"] >= 0 else P["red"]) if worst is not None else "",
                 ),
             ]
         ),
