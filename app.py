@@ -237,9 +237,11 @@ def _parse_frame(df: pd.DataFrame) -> pd.DataFrame:
 def load_trades(file_bytes_list: list[bytes]) -> pd.DataFrame:
     """
     Parse one or more uploaded CSVs (Robinhood exports or this app's own backup
-    files) into a clean trades frame. Whole identical files are de-duplicated so
-    re-uploading the same export is a no-op, without collapsing genuine identical
-    fills inside a single export.
+    files) into a clean trades frame. Whole identical files are de-duplicated,
+    and when several files OVERLAP (e.g. a full-history export plus a recent
+    one), each calendar date's trades come from a single file — later-listed
+    files win — so overlapping dates are never counted twice. Genuine identical
+    fills within a single file are preserved.
     """
     from io import BytesIO
     import hashlib
@@ -254,7 +256,13 @@ def load_trades(file_bytes_list: list[bytes]) -> pd.DataFrame:
 
     if not parsed:
         return pd.DataFrame(columns=PARSED_COLS)
-    return pd.concat(parsed, ignore_index=True).reset_index(drop=True)
+
+    # Fold files together by date: a date present in a later file replaces the
+    # same date from an earlier file rather than being appended to it.
+    combined = parsed[0]
+    for frame in parsed[1:]:
+        combined = merge_by_date(combined, frame)
+    return combined.reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------- #
