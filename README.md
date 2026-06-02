@@ -1,4 +1,4 @@
-# 📈 0DTE Trade Journal
+# 📈 Trade Journal
 
 A private, password-protected Streamlit app that turns your Robinhood activity
 CSV into a calendar-style trading journal — daily P&L, trade counts, win rates,
@@ -86,11 +86,35 @@ Opens at http://localhost:8501.
 
 1. In Robinhood: **Account → Statements & history → Reports & statements →
    Generate report** (or the CSV export of account activity).
-2. Each time, export your **full month-to-date** activity and upload that one
-   file. It always shows the complete picture, and re-uploading the same file
-   is harmless.
-3. Switch months with the **Month** dropdown — it defaults to the most recent
-   month in your data, so come June it'll land on June automatically.
+2. Upload it. New uploads are **saved and merged** with what's already there,
+   so you can upload just the new day or a full export — either works. Any date
+   in a new upload replaces that date's rows (no double-counting); dates you
+   don't re-upload are kept.
+3. Next time you log in, your saved data loads automatically — no need to
+   re-upload to see it.
+4. Switch months with the **Month** dropdown — it defaults to the most recent
+   month in your data.
+
+## Saving your data — how it works and its limits
+
+The app writes your merged trades to `data/master_trades.csv` and reloads it on
+startup. **Important caveat on Streamlit Community Cloud:** that filesystem is
+*ephemeral* — the saved file survives normal use and logins while the app stays
+"warm," but it is wiped whenever the app cold-reboots (after long inactivity) or
+you push a new commit (the repo overwrites the container). So treat local saving
+as a convenience, not permanent storage.
+
+Two ways to stay safe:
+
+- **Download backup** (sidebar button) saves a copy of everything. If the app
+  ever resets, just re-upload that backup file to restore your full journal.
+- **Cumulative export fallback:** if you'd rather not rely on saving at all,
+  export your *full month-to-date* activity from Robinhood each time — one file
+  always contains everything, so nothing is ever lost.
+
+For *guaranteed* cross-day persistence without manual backups, connect a small
+external store (Google Sheets is the easiest free option). Ask and this can be
+wired in — it needs a Google service account and a shared sheet.
 
 ---
 
@@ -100,6 +124,6 @@ Opens at http://localhost:8501.
 |------|---------|
 | `app.py` | The Streamlit app |
 | `requirements.txt` | Python dependencies for Streamlit Cloud |
-| `.streamlit/config.toml` | Light theme + 50 MB upload limit |
+| `.streamlit/config.toml` | Theme + 50 MB upload limit |
 | `.streamlit/secrets.toml.example` | Template — copy to `secrets.toml` locally |
-| `.gitignore` | Keeps secrets and CSVs out of git |
+| `.gitignore` | Keeps secrets and CSVs (incl. saved data) out of git |

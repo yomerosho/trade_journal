@@ -192,57 +192,118 @@ def parse_money(x) -> float:
     return -v if neg else v
 
 
-@st.cache_data(show_spinner=False)
-def load_trades(file_bytes_list: list[bytes]) -> pd.DataFrame:
-    """
-    Parse one or more Robinhood activity CSV exports into a clean trades frame.
-    Multiple files are concatenated and de-duplicated, so you can upload a fresh
-    export a couple of times a week and the journal just grows.
-    """
-    from io import BytesIO
-    import hashlib
+PARSED_COLS = ["date", "instrument", "description", "trans_code", "price", "amount"]
 
-    # De-duplicate whole identical files (so re-uploading the same export is a
-    # no-op) WITHOUT collapsing genuine identical fills inside a single export.
-    seen, frames = set(), []
-    for raw in file_bytes_list:
-        h = hashlib.md5(raw).hexdigest()
-        if h in seen:
-            continue
-        seen.add(h)
-        frames.append(pd.read_csv(BytesIO(raw), on_bad_lines="skip"))
 
-    if not frames:
-        return pd.DataFrame()
+def _parse_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Parse a single uploaded frame into the parsed-schema trades frame.
+    Accepts either a Robinhood export or a previously-downloaded backup CSV."""
+    lower = {c.lower() for c in df.columns}
 
-    df = pd.concat(frames, ignore_index=True)
+    # Already-parsed backup CSV (downloaded from this app)
+    if {"date", "trans_code", "amount"}.issubset(lower):
+        d = df.copy()
+        d.columns = [c.lower() for c in d.columns]
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        d["amount"] = pd.to_numeric(d["amount"], errors="coerce").fillna(0.0)
+        for c in PARSED_COLS:
+            if c not in d.columns:
+                d[c] = pd.NA
+        return d.dropna(subset=["date"])[PARSED_COLS]
 
-    # Robinhood column names
+    # Robinhood activity export
     needed = ["Activity Date", "Instrument", "Description", "Trans Code", "Quantity", "Price", "Amount"]
     for col in needed:
         if col not in df.columns:
             df[col] = pd.NA
-
-    # Drop footer / blank rows
     df = df.dropna(subset=["Activity Date", "Trans Code"])
     df = df[df["Activity Date"].astype(str).str.strip() != ""]
-
     df["amount"] = df["Amount"].apply(parse_money)
     df["date"] = pd.to_datetime(df["Activity Date"], errors="coerce")
     df = df.dropna(subset=["date"])
-
-    # Keep only option trade legs
     trades = df[df["Trans Code"].isin(TRADE_CODES)].copy()
     trades = trades.rename(
         columns={
             "Instrument": "instrument",
             "Description": "description",
             "Trans Code": "trans_code",
-            "Quantity": "quantity",
             "Price": "price",
         }
     )
-    return trades[["date", "instrument", "description", "trans_code", "price", "amount"]].reset_index(drop=True)
+    return trades[PARSED_COLS].reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_trades(file_bytes_list: list[bytes]) -> pd.DataFrame:
+    """
+    Parse one or more uploaded CSVs (Robinhood exports or this app's own backup
+    files) into a clean trades frame. Whole identical files are de-duplicated so
+    re-uploading the same export is a no-op, without collapsing genuine identical
+    fills inside a single export.
+    """
+    from io import BytesIO
+    import hashlib
+
+    seen, parsed = set(), []
+    for raw in file_bytes_list:
+        h = hashlib.md5(raw).hexdigest()
+        if h in seen:
+            continue
+        seen.add(h)
+        parsed.append(_parse_frame(pd.read_csv(BytesIO(raw), on_bad_lines="skip")))
+
+    if not parsed:
+        return pd.DataFrame(columns=PARSED_COLS)
+    return pd.concat(parsed, ignore_index=True).reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+#  Persistence — best-effort local store that the app reloads on startup
+# --------------------------------------------------------------------------- #
+import os
+
+DATA_DIR = "data"
+MASTER_FILE = os.path.join(DATA_DIR, "master_trades.csv")
+
+
+def load_master() -> pd.DataFrame:
+    """Load the accumulated trades saved from previous uploads (if any)."""
+    if os.path.exists(MASTER_FILE):
+        try:
+            d = pd.read_csv(MASTER_FILE)
+            d["date"] = pd.to_datetime(d["date"], errors="coerce")
+            d["amount"] = pd.to_numeric(d["amount"], errors="coerce").fillna(0.0)
+            return d.dropna(subset=["date"])[PARSED_COLS]
+        except Exception:
+            return pd.DataFrame(columns=PARSED_COLS)
+    return pd.DataFrame(columns=PARSED_COLS)
+
+
+def save_master(trades: pd.DataFrame) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    out = trades.copy()
+    out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    out.to_csv(MASTER_FILE, index=False)
+
+
+def merge_by_date(master: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
+    """Accumulate uploads. Any date present in `new` replaces that date's rows
+    in `master`; dates only in `master` are kept. This makes both incremental
+    (one new day) and cumulative (full month) uploads correct, and avoids both
+    double-counting and collapsing identical same-day fills."""
+    if master is None or master.empty:
+        return new.copy()
+    if new is None or new.empty:
+        return master.copy()
+    new_dates = set(new["date"].dt.normalize())
+    kept = master[~master["date"].dt.normalize().isin(new_dates)]
+    return pd.concat([kept, new], ignore_index=True)
+
+
+def backup_csv(trades: pd.DataFrame) -> str:
+    out = trades.copy()
+    out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    return out.to_csv(index=False)
 
 
 @st.cache_data(show_spinner=False)
@@ -391,12 +452,12 @@ def main():
         st.header("Upload activity")
         st.caption(
             "Drop in your Robinhood **Account → Statements & history → "
-            "Export** CSV. Tip: each visit, export your **full month-to-date** "
-            "activity and upload that one file — it always shows the complete "
-            "picture. (Uploading the same file twice is harmless.)"
+            "Export** CSV. New uploads are **saved and merged** with what's "
+            "already there — upload just the new day, or a full export; either "
+            "works. You can also re-upload a backup file here to restore."
         )
         files = st.file_uploader(
-            "Robinhood CSV export(s)",
+            "CSV export(s)",
             type=["csv"],
             accept_multiple_files=True,
         )
@@ -406,8 +467,21 @@ def main():
             st.session_state.update(keep)
             st.rerun()
 
-    if not files:
-        st.info("👈 Upload one or more Robinhood CSV exports to build your journal.")
+    # ---- Load saved data, merge any new uploads, persist -------------------
+    master = load_master()
+    if files:
+        new = load_trades([f.getvalue() for f in files])
+        if new.empty:
+            st.warning("No option trades found in the uploaded file(s); showing saved data.")
+            trades = master
+        else:
+            trades = merge_by_date(master, new)
+            save_master(trades)
+    else:
+        trades = master
+
+    if trades.empty:
+        st.info("👈 Upload a Robinhood CSV export to build your journal.")
         st.markdown(
             "**How P&L is calculated:** each option contract (same strike, "
             "expiry, and put/call) is treated as one *trade*. Its P&L is the "
@@ -417,10 +491,36 @@ def main():
         )
         return
 
-    trades = load_trades([f.getvalue() for f in files])
-    if trades.empty:
-        st.warning("No option trades found in the uploaded file(s).")
-        return
+    # ---- Saved-data status + backup/reset (sidebar) -----------------------
+    with st.sidebar:
+        st.divider()
+        dmin, dmax = trades["date"].min(), trades["date"].max()
+        ndays = trades["date"].dt.normalize().nunique()
+        st.caption(
+            f"💾 **Saved:** {dmin.strftime('%b %-d')} → {dmax.strftime('%b %-d, %Y')} "
+            f"· {ndays} day{'s' if ndays != 1 else ''}"
+        )
+        st.download_button(
+            "⬇️ Download backup",
+            backup_csv(trades),
+            file_name="trade_journal_backup.csv",
+            mime="text/csv",
+            help="Save a copy you can re-upload later to restore your journal.",
+        )
+        if st.session_state.get("confirm_reset"):
+            st.warning("Delete all saved data?")
+            c_yes, c_no = st.columns(2)
+            if c_yes.button("Yes, delete"):
+                if os.path.exists(MASTER_FILE):
+                    os.remove(MASTER_FILE)
+                st.session_state.pop("confirm_reset", None)
+                st.rerun()
+            if c_no.button("Cancel"):
+                st.session_state.pop("confirm_reset", None)
+                st.rerun()
+        elif st.button("🗑️ Reset saved data"):
+            st.session_state["confirm_reset"] = True
+            st.rerun()
 
     daily = build_journal(trades)
 
