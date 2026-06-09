@@ -473,8 +473,14 @@ def render_calendar(year: int, month: int, daily: pd.DataFrame, P: dict) -> str:
             if day in stats:
                 s = stats[day]
                 bg, border, txt = day_color(s["pnl"], max_abs, P)
+                tip = (
+                    f"Realized P&L: {fmt_money(s['pnl'], k=False)} · "
+                    f"{int(s['trades'])} closed trade{'s' if s['trades']!=1 else ''} · "
+                    f"{s['win_rate']:.0f}% win — booked on the day each trade was closed "
+                    f"(matches Robinhood's Realized P&L page)."
+                )
                 html += (
-                    f"<td class='cell' style='background:{bg};border-color:{border}'>"
+                    f"<td class='cell' style='background:{bg};border-color:{border}' title=\"{tip}\">"
                     f"<div class='dnum'>{day}</div>"
                     f"<div class='pnl' style='color:{txt}'>{fmt_money(s['pnl'])}</div>"
                     f"<div class='sub'>{int(s['trades'])} trade{'s' if s['trades']!=1 else ''}<br>"
@@ -648,6 +654,12 @@ def main():
     left, right = st.columns([4, 1])
     with left:
         st.markdown(f"#### {calendar.month_name[month]} {year}")
+        st.caption(
+            "Figures are **realized P&L**, booked on the day a trade is *closed* "
+            "(matches Robinhood's **Realized profit & loss** page). This won't equal "
+            "the home-screen **\"Today\"** number, which marks open positions to "
+            "market — they differ only when a position is held overnight."
+        )
         st.markdown(render_calendar(year, month, daily, P), unsafe_allow_html=True)
     with right:
         st.markdown("#### Weekly")
