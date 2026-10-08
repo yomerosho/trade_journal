@@ -329,37 +329,50 @@ def backup_csv(trades: pd.DataFrame) -> str:
     return out.to_csv(index=False)
 
 
+TRADE_LOG_COLS = [
+    "date", "instrument", "description", "side", "pnl", "basis", "expired",
+    "n_prices", "entry_row", "exit_row", "opened",
+]
+
+
 @st.cache_data(show_spinner=False)
-def build_journal(trades: pd.DataFrame) -> pd.DataFrame:
+def build_trade_log(trades: pd.DataFrame) -> pd.DataFrame:
     """
-    Aggregate to a daily journal using realized P&L.
+    One row per contract per day that had a realized close (or expiry), using
+    realized P&L.
 
     Each option contract (instrument + description = strike + expiry + put/call)
     is tracked with an average cost basis. Opens (BTO/STO) add to the basis;
-    closes (STC/BTC) realize P&L = proceeds − average cost of the quantity
+    closes (STC/BTC) realize P&L = proceeds - average cost of the quantity
     closed, attributed to the *closing* day. Expirations (OEXP) realize the
     remaining basis as a loss. This is correct for both same-day (0DTE) trades
-    and positions held across multiple days. A "trade" for a given day is a
-    contract that had a realized close (or expiry) that day; a win is realized
-    P&L > 0. Positions still open contribute no realized P&L until closed.
+    and positions held across multiple days. Positions still open contribute no
+    realized P&L until closed.
+
+    Alongside P&L each row records the cost basis closed, how many distinct
+    prices the day's opening fills were at, and the file-row position of the
+    first entry / last exit (used to infer intraday order, see analytics).
     """
     if trades.empty:
-        return pd.DataFrame(columns=["date", "pnl", "trades", "wins", "win_rate"])
+        return pd.DataFrame(columns=TRADE_LOG_COLS)
 
     t = trades.copy()
     t["quantity"] = pd.to_numeric(t["quantity"], errors="coerce").fillna(0.0)
     t["amount"] = pd.to_numeric(t["amount"], errors="coerce").fillna(0.0)
+    t["price"] = pd.to_numeric(t["price"], errors="coerce")
     # Robinhood labels expiries "Option Expiration for SPY 10/1/2026 Call $770.00";
     # strip the prefix so the OEXP row groups with the contract it expires.
     t["description"] = t["description"].astype(str).str.replace(
         r"^Option Expiration for\s+", "", regex=True
     )
+    t["_row"] = range(len(t))  # upload order, kept through save/merge
     t = t.sort_values("date", kind="stable")
 
-    rows = []  # (date, realized_pnl) per contract-day that had a realized close
-    for _, g in t.groupby(["instrument", "description"], dropna=False):
+    rows = []
+    for (ins, desc), g in t.groupby(["instrument", "description"], dropna=False):
         carry_q = 0.0   # open contracts carried across days
         carry_c = 0.0   # cost basis of those carried contracts
+        opened = None   # day the current position was first opened
         for dt, gd in g.groupby("date"):
             opens = gd[gd["trans_code"].isin(["BTO", "STO"])]
             closes = gd[gd["trans_code"].isin(["STC", "BTC"])]
@@ -370,11 +383,15 @@ def build_journal(trades: pd.DataFrame) -> pd.DataFrame:
             close_q = closes["quantity"].sum()
             close_proceeds = closes["amount"].sum()    # sells are positive
 
+            if open_q > 0 and carry_q <= 0:
+                opened = dt
+
             avail_q = carry_q + open_q
             avail_c = carry_c + open_c
             avg = avail_c / avail_q if avail_q > 0 else 0.0
 
             day_pnl = 0.0
+            basis = 0.0
             had_close = False
 
             if close_q > 0:
@@ -383,26 +400,57 @@ def build_journal(trades: pd.DataFrame) -> pd.DataFrame:
                 # scale proceeds if (rarely) more closed than we can account for
                 proceeds = close_proceeds * (eff_q / close_q) if close_q else 0.0
                 day_pnl += proceeds - avg * eff_q
+                basis += avg * eff_q
                 avail_q -= eff_q
                 avail_c -= avg * eff_q
 
             if len(expd) > 0:
                 had_close = True
                 day_pnl += -avail_c       # remaining basis expires worthless
+                basis += avail_c
                 avail_q = 0.0
                 avail_c = 0.0
 
             if had_close:
-                rows.append((dt, day_pnl))
+                exits = pd.concat([closes["_row"], expd["_row"]])
+                rows.append({
+                    "date": dt,
+                    "instrument": ins,
+                    "description": desc,
+                    "pnl": day_pnl,
+                    "basis": basis,
+                    "expired": len(expd) > 0,
+                    "n_prices": int(opens["price"].nunique()),
+                    "entry_row": opens["_row"].max() if len(opens) else float("nan"),
+                    "exit_row": exits.min(),
+                    "opened": opened,
+                })
 
             carry_q, carry_c = avail_q, avail_c
+            if carry_q <= 1e-9:
+                opened = None
 
     if not rows:
+        return pd.DataFrame(columns=TRADE_LOG_COLS)
+
+    log = pd.DataFrame(rows)
+    log["side"] = log["description"].str.extract(r"\b(Call|Put)\b", expand=False).fillna("Other")
+    return log[TRADE_LOG_COLS].sort_values("date", kind="stable").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def build_journal(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate the trade log to a daily journal. A "trade" for a given day is a
+    contract that had a realized close (or expiry) that day; a win is realized
+    P&L > 0.
+    """
+    log = build_trade_log(trades)
+    if log.empty:
         return pd.DataFrame(columns=["date", "pnl", "trades", "wins", "win_rate"])
 
-    rt = pd.DataFrame(rows, columns=["date", "pnl"])
     daily = (
-        rt.groupby("date")
+        log.groupby("date")
         .agg(
             pnl=("pnl", "sum"),
             trades=("pnl", "size"),
@@ -518,6 +566,316 @@ def weekly_summary(year: int, month: int, daily: pd.DataFrame) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
+#  Analytics tab
+# --------------------------------------------------------------------------- #
+DOW_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+
+def _money(v: float) -> str:
+    if pd.isna(v):
+        return "-"
+    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+
+
+def perf_table(log: pd.DataFrame, by) -> pd.DataFrame:
+    """Trades / P&L / win % / avg per trade / profit factor for each group."""
+    g = log.groupby(by, observed=True, sort=False)["pnl"]
+    return pd.DataFrame({
+        "Trades": g.size(),
+        "P&L": g.sum(),
+        "Win %": g.apply(lambda s: (s > 0).mean() * 100),
+        "Avg / trade": g.mean(),
+        "Profit factor": g.apply(
+            lambda s: s[s > 0].sum() / -s[s < 0].sum() if (s < 0).any() else float("nan")
+        ),
+    })
+
+
+def show_table(df: pd.DataFrame, P: dict, index_name: str = "") -> None:
+    """Render a perf-style table with $ formatting and green/red P&L."""
+    money = [c for c in df.columns if c in ("P&L", "Avg / trade", "Avg / day", "Median day",
+                                             "Best", "Worst", "Single-price P&L",
+                                             "Multi-price P&L", "Calls P&L", "Puts P&L")]
+    fmt = {c: _money for c in money}
+    fmt.update({c: "{:.1f}%" for c in df.columns if c.endswith("%")})
+    fmt.update({c: "{:.2f}" for c in df.columns if c == "Profit factor"})
+    sty = (
+        df.rename_axis(index_name)
+        .style.format(fmt, na_rep="-")
+        .map(lambda v: f"color:{P['green'] if v > 0 else P['red'] if v < 0 else P['text']}",
+             subset=money)
+    )
+    st.dataframe(sty, use_container_width=True)
+
+
+def themed(chart, P: dict):
+    """Match Altair charts to the active palette (the dark theme is CSS-only,
+    so Vega would otherwise draw on white)."""
+    return (
+        chart.configure(background=P["panel"])
+        .configure_view(strokeWidth=0)
+        .configure_axis(labelColor=P["muted"], titleColor=P["muted"],
+                        gridColor=P["border"], domainColor=P["border"], tickColor=P["border"])
+    )
+
+
+def line_area(series: pd.Series, P: dict, color: str, area: bool = False, height: int = 240):
+    """Themed time-series line (or filled area) chart for a date-indexed Series."""
+    import altair as alt
+
+    df = series.rename("v").rename_axis("date").reset_index()
+    mark = (alt.Chart(df).mark_area(color=color, opacity=0.55, line={"color": color})
+            if area else alt.Chart(df).mark_line(color=color, strokeWidth=2))
+    return themed(
+        mark.encode(
+            x=alt.X("date:T", title=None),
+            y=alt.Y("v:Q", title=None, axis=alt.Axis(format="$,.0f")),
+            tooltip=[alt.Tooltip("date:T"), alt.Tooltip("v:Q", format="$,.0f", title=series.name)],
+        ).properties(height=height),
+        P,
+    )
+
+
+def signed_bars(df: pd.DataFrame, x: str, y: str, P: dict, sort=None, height: int = 220):
+    """Bar chart colored green/red by sign of y."""
+    import altair as alt
+
+    return themed(
+        alt.Chart(df)
+        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X(f"{x}:N", sort=sort, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y(f"{y}:Q", title=None, axis=alt.Axis(format="$,.0f")),
+            color=alt.condition(alt.datum[y] >= 0, alt.value(P["green"]), alt.value(P["red"])),
+            tooltip=[alt.Tooltip(f"{x}:N"), alt.Tooltip(f"{y}:Q", format="$,.0f")],
+        )
+        .properties(height=height),
+        P,
+    )
+
+
+def add_intraday_order(log: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robinhood exports carry no timestamps, but list each day's fills in time
+    order (newest first) and uploads keep that order. From it, rank each
+    same-day entry within its day and work out how much P&L had already been
+    realized that day when the trade was entered.
+    """
+    same = log[log["entry_row"].notna()].copy()
+    if same.empty:
+        return same.assign(seq=pd.Series(dtype=int), day_before=pd.Series(dtype=float))
+
+    # Larger row = earlier when the file is newest-first. Detect the direction
+    # from the data (a trade's entry should precede its exit) and adapt.
+    newest_first = (same["entry_row"] >= same["exit_row"]).mean() >= 0.5
+    sign = 1 if newest_first else -1
+    same["t_in"] = -sign * same["entry_row"]     # smaller = earlier
+    same["t_out"] = -sign * same["exit_row"]
+
+    same["seq"] = same.groupby("date")["t_in"].rank(method="first").astype(int)
+    same["day_before"] = 0.0
+    for _, g in same.groupby("date"):
+        t_out, pnl = g["t_out"].to_numpy(), g["pnl"].to_numpy()
+        for idx, t_in in zip(g.index, g["t_in"].to_numpy()):
+            same.at[idx, "day_before"] = (pnl * (t_out < t_in)).sum()
+    return same
+
+
+def render_analytics(log: pd.DataFrame, daily: pd.DataFrame, P: dict) -> None:
+    years = sorted({d.year for d in daily["date"]}, reverse=True)
+    opts = [str(y) for y in years] + ["All time"]
+    pick = st.selectbox("Period", opts, index=0, key="analytics_period")
+    if pick != "All time":
+        y = int(pick)
+        log = log[log["date"].dt.year == y]
+        daily = daily[daily["date"].dt.year == y]
+    if log.empty:
+        st.info("No closed trades in this period.")
+        return
+
+    log = log.copy()
+    log["style"] = pd.Categorical(
+        log["n_prices"].map(lambda n: "Carried in" if n == 0 else "Single price" if n == 1
+                            else "2 prices" if n == 2 else "3+ prices"),
+        ["Single price", "2 prices", "3+ prices", "Carried in"],
+    )
+    daily = daily.copy()
+    daily["dow"] = daily["date"].dt.strftime("%a")
+
+    # ---- Headline strip ---------------------------------------------------
+    pnl = log["pnl"]
+    wins, losses = pnl[pnl > 0], pnl[pnl < 0]
+    pf = wins.sum() / -losses.sum() if len(losses) else float("nan")
+    curve = daily.set_index("date")["pnl"].cumsum()
+    dd = curve - curve.cummax().clip(lower=0)
+    total = pnl.sum()
+    st.markdown(
+        gex_strip([
+            ("Net P&L", fmt_money(total, k=False), P["green"] if total >= 0 else P["red"]),
+            ("Trades", f"{len(log)}", ""),
+            ("Win Rate", f"{(pnl > 0).mean() * 100:.1f}%", ""),
+            ("Profit Factor", f"{pf:.2f}" if pd.notna(pf) else "-", ""),
+            ("Avg Win / Loss", f"{fmt_money(wins.mean() if len(wins) else 0)} / "
+                               f"{fmt_money(losses.mean() if len(losses) else 0)}", ""),
+            ("Per Trade", fmt_money(pnl.mean()), P["green"] if pnl.mean() >= 0 else P["red"]),
+            ("Max Drawdown", fmt_money(dd.min()), P["red"] if dd.min() < 0 else ""),
+            ("Green Days", f"{int((daily['pnl'] > 0).sum())}/{len(daily)}", ""),
+        ]),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "A *trade* is one contract closed (or expired) on a day, the same unit the "
+        "calendar counts. Profit factor = gross wins / gross losses; above 1.0 is "
+        "profitable. Max drawdown is the deepest fall from a running peak."
+    )
+
+    # ---- Equity curve + drawdown -----------------------------------------
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### Cumulative P&L")
+        st.altair_chart(line_area(curve.rename("Cumulative P&L"), P, P["accent"]),
+                        use_container_width=True)
+    with c2:
+        st.markdown("#### Drawdown from peak")
+        st.altair_chart(line_area(dd.rename("Drawdown"), P, P["red"], area=True),
+                        use_container_width=True)
+
+    # ---- Monthly ------------------------------------------------------------
+    st.markdown("#### By month")
+    mkey = log["date"].dt.to_period("M")
+    monthly = perf_table(log, mkey).sort_index()
+    dm = daily.groupby(daily["date"].dt.to_period("M"))["pnl"]
+    monthly["Green days"] = (dm.apply(lambda s: f"{(s > 0).sum()}/{len(s)}")
+                             .reindex(monthly.index))
+    monthly.index = monthly.index.strftime("%b %Y")
+    st.altair_chart(
+        signed_bars(monthly.reset_index(names="month").rename(columns={"P&L": "pnl"}),
+                    "month", "pnl", P, sort=list(monthly.index)),
+        use_container_width=True,
+    )
+    show_table(monthly, P, "Month")
+
+    st.divider()
+
+    # ---- How you enter ------------------------------------------------------
+    st.markdown("#### How you enter")
+    st.caption(
+        "Grouped by how many distinct prices the day's opening fills were at. "
+        "*Single price* = one entry; *2 / 3+ prices* = added to the position "
+        "(averaging down or up). *Carried in* = opened on an earlier day."
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        show_table(perf_table(log, "style").sort_index(), P, "Entry")
+    with c2:
+        size_b = pd.cut(log["basis"], [-1, 500, 1000, 2000, 5000, float("inf")],
+                        labels=["< $500", "$500-1K", "$1-2K", "$2-5K", "$5K+"])
+        show_table(perf_table(log, size_b).sort_index(), P, "Position size")
+
+    # ---- Timing within the day -------------------------------------------
+    st.markdown("#### Timing within the day")
+    st.caption(
+        "Robinhood's export has no timestamps, so this uses the order of fills "
+        "in the file to rank your entries within each day. Treat the 1st trade "
+        "as roughly 'the open'."
+    )
+    seq = add_intraday_order(log)
+    if not seq.empty:
+        c1, c2 = st.columns(2)
+        with c1:
+            seq_b = pd.cut(seq["seq"], [0, 1, 2, 3, 5, 8, 999],
+                           labels=["1st", "2nd", "3rd", "4th-5th", "6th-8th", "9th+"])
+            show_table(perf_table(seq, seq_b).sort_index(), P, "Entry # of day")
+        with c2:
+            state = pd.cut(seq["day_before"], [-float("inf"), -1000, -0.005, 0.005, 1000, float("inf")],
+                           labels=["Down > $1K", "Down < $1K", "Nothing closed yet",
+                                   "Up < $1K", "Up > $1K"])
+            show_table(perf_table(seq, state).sort_index(), P, "Day P&L at entry")
+        first = seq[seq["seq"] == 1]
+        if len(first):
+            show_table(perf_table(first, "style").sort_index(), P, "1st trade: entry")
+
+    st.divider()
+
+    # ---- Day of week --------------------------------------------------------
+    st.markdown("#### Day of week")
+    g = daily.groupby("dow")["pnl"]
+    dow = pd.DataFrame({
+        "Days": g.size(),
+        "P&L": g.sum(),
+        "Avg / day": g.mean(),
+        "Median day": g.median(),
+        "Green %": g.apply(lambda s: (s > 0).mean() * 100),
+        "Best": g.max(),
+        "Worst": g.min(),
+    }).reindex([d for d in DOW_ORDER if d in set(daily["dow"])])
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        st.altair_chart(
+            signed_bars(dow.reset_index(names="day").rename(columns={"P&L": "pnl"}),
+                        "day", "pnl", P, sort=DOW_ORDER),
+            use_container_width=True,
+        )
+    with c2:
+        show_table(dow, P, "Day")
+
+    import altair as alt
+    heat = (daily.assign(month=daily["date"].dt.strftime("%Y-%m"))
+            .groupby(["month", "dow"], as_index=False)["pnl"].sum())
+    lim = float(heat["pnl"].abs().max() or 1)
+    st.altair_chart(themed(
+        alt.Chart(heat).mark_rect(cornerRadius=3).encode(
+            x=alt.X("dow:N", sort=DOW_ORDER, title=None, axis=alt.Axis(labelAngle=0, orient="top")),
+            y=alt.Y("month:O", title=None),
+            color=alt.Color("pnl:Q", legend=None, scale=alt.Scale(
+                domain=[-lim, 0, lim], range=[P["red"], P["panel_2"], P["green"]],
+                interpolate="rgb")),
+            tooltip=["month", "dow", alt.Tooltip("pnl:Q", format="$,.0f", title="P&L")],
+        ).properties(height=max(120, 26 * heat["month"].nunique())), P),
+        use_container_width=True,
+    )
+
+    nb = pd.cut(daily["trades"], [0, 2, 4, 7, 12, float("inf")],
+                labels=["1-2", "3-4", "5-7", "8-12", "13+"])
+    g = daily.groupby(nb, observed=True)["pnl"]
+    by_n = pd.DataFrame({"Days": g.size(), "P&L": g.sum(), "Avg / day": g.mean(),
+                         "Green %": g.apply(lambda s: (s > 0).mean() * 100)})
+    st.markdown("##### Trades per day")
+    show_table(by_n, P, "Trades that day")
+
+    st.divider()
+
+    # ---- Tickers -----------------------------------------------------------
+    st.markdown("#### By ticker")
+    min_n = st.number_input("Minimum trades", min_value=1, value=5, step=1, key="analytics_min_n")
+    tk = perf_table(log, "instrument")
+    single = log["n_prices"] <= 1
+    tk["Single-price P&L"] = log[single].groupby("instrument")["pnl"].sum()
+    tk["Multi-price P&L"] = log[~single].groupby("instrument")["pnl"].sum()
+    tk["Calls P&L"] = log[log["side"] == "Call"].groupby("instrument")["pnl"].sum()
+    tk["Puts P&L"] = log[log["side"] == "Put"].groupby("instrument")["pnl"].sum()
+    tm = log.groupby(["instrument", log["date"].dt.to_period("M")])["pnl"].sum()
+    tk["Green months"] = tm.groupby(level=0).apply(lambda s: f"{(s > 0).sum()}/{len(s)}")
+    tk[["Single-price P&L", "Multi-price P&L", "Calls P&L", "Puts P&L"]] = (
+        tk[["Single-price P&L", "Multi-price P&L", "Calls P&L", "Puts P&L"]].fillna(0.0))
+    tk = tk[tk["Trades"] >= min_n].sort_values("P&L", ascending=False)
+    show_table(tk, P, "Ticker")
+
+    # ---- Biggest trades ----------------------------------------------------
+    with st.expander("Biggest wins and losses"):
+        cols = {"date": "Date", "description": "Contract", "pnl": "P&L", "basis": "Cost basis"}
+        c1, c2 = st.columns(2)
+        for col, title, rows in ((c1, "Wins", log.nlargest(10, "pnl")),
+                                 (c2, "Losses", log.nsmallest(10, "pnl"))):
+            with col:
+                st.markdown(f"**{title}**")
+                t = rows[list(cols)].rename(columns=cols)
+                t["Date"] = t["Date"].dt.strftime("%m/%d/%y")
+                st.dataframe(t.style.format({"P&L": _money, "Cost basis": _money}),
+                             use_container_width=True, hide_index=True)
+
+
+# --------------------------------------------------------------------------- #
 #  Main app
 # --------------------------------------------------------------------------- #
 def main():
@@ -611,109 +969,115 @@ def main():
 
     daily = build_journal(trades)
 
-    # Month picker — default to most recent month in the data
-    months = sorted({(d.year, d.month) for d in daily["date"]}, reverse=True)
-    labels = [f"{calendar.month_name[m]} {y}" for (y, m) in months]
-    pick = st.selectbox("Month", labels, index=0)
-    year, month = months[labels.index(pick)]
+    tab_cal, tab_an = st.tabs(["📅 Calendar", "📊 Analytics"])
 
-    mdaily = daily[(daily["date"].dt.year == year) & (daily["date"].dt.month == month)]
+    with tab_cal:
+        # Month picker — default to most recent month in the data
+        months = sorted({(d.year, d.month) for d in daily["date"]}, reverse=True)
+        labels = [f"{calendar.month_name[m]} {y}" for (y, m) in months]
+        pick = st.selectbox("Month", labels, index=0)
+        year, month = months[labels.index(pick)]
 
-    # ---- Monthly stat header (GEX-Metrix-style data strip) ----------------
-    total = mdaily["pnl"].sum()
-    n_days = len(mdaily)
-    n_trades = int(mdaily["trades"].sum())
-    n_wins = int(mdaily["wins"].sum())
-    win_rate = (n_wins / n_trades * 100) if n_trades else 0
-    green_days = int((mdaily["pnl"] > 0).sum())
-    avg_day = total / n_days if n_days else 0
-    best = mdaily.loc[mdaily["pnl"].idxmax()] if n_days else None
-    worst = mdaily.loc[mdaily["pnl"].idxmin()] if n_days else None
-    pnl_color = P["green"] if total >= 0 else P["red"]
+        mdaily = daily[(daily["date"].dt.year == year) & (daily["date"].dt.month == month)]
 
-    st.markdown(
-        gex_strip(
-            [
-                ("Net P&L", fmt_money(total, k=False), pnl_color),
-                ("Win Rate", f"{win_rate:.1f}%", ""),
-                ("Trading Days", str(n_days), ""),
-                ("Total Trades", str(n_trades), ""),
-                ("Green Days", f"{green_days}/{n_days}", ""),
-                ("Avg / Day", fmt_money(avg_day, k=False), P["green"] if avg_day >= 0 else P["red"]),
-                (
-                    "Best Day",
-                    f"{fmt_money(best['pnl'])} · {best['date'].strftime('%-m/%-d')}" if best is not None else "—",
-                    (P["green"] if best["pnl"] >= 0 else P["red"]) if best is not None else "",
-                ),
-                (
-                    "Worst Day",
-                    f"{fmt_money(worst['pnl'])} · {worst['date'].strftime('%-m/%-d')}" if worst is not None else "—",
-                    (P["green"] if worst["pnl"] >= 0 else P["red"]) if worst is not None else "",
-                ),
-            ]
-        ),
-        unsafe_allow_html=True,
-    )
+        # ---- Monthly stat header (GEX-Metrix-style data strip) ----------------
+        total = mdaily["pnl"].sum()
+        n_days = len(mdaily)
+        n_trades = int(mdaily["trades"].sum())
+        n_wins = int(mdaily["wins"].sum())
+        win_rate = (n_wins / n_trades * 100) if n_trades else 0
+        green_days = int((mdaily["pnl"] > 0).sum())
+        avg_day = total / n_days if n_days else 0
+        best = mdaily.loc[mdaily["pnl"].idxmax()] if n_days else None
+        worst = mdaily.loc[mdaily["pnl"].idxmin()] if n_days else None
+        pnl_color = P["green"] if total >= 0 else P["red"]
 
-    # ---- Calendar + weekly rail -------------------------------------------
-    left, right = st.columns([4, 1])
-    with left:
-        st.markdown(f"#### {calendar.month_name[month]} {year}")
-        st.caption(
-            "Figures are **realized P&L**, booked on the day a trade is *closed* "
-            "(matches Robinhood's **Realized profit & loss** page). This won't equal "
-            "the home-screen **\"Today\"** number, which marks open positions to "
-            "market — they differ only when a position is held overnight."
+        st.markdown(
+            gex_strip(
+                [
+                    ("Net P&L", fmt_money(total, k=False), pnl_color),
+                    ("Win Rate", f"{win_rate:.1f}%", ""),
+                    ("Trading Days", str(n_days), ""),
+                    ("Total Trades", str(n_trades), ""),
+                    ("Green Days", f"{green_days}/{n_days}", ""),
+                    ("Avg / Day", fmt_money(avg_day, k=False), P["green"] if avg_day >= 0 else P["red"]),
+                    (
+                        "Best Day",
+                        f"{fmt_money(best['pnl'])} · {best['date'].strftime('%-m/%-d')}" if best is not None else "—",
+                        (P["green"] if best["pnl"] >= 0 else P["red"]) if best is not None else "",
+                    ),
+                    (
+                        "Worst Day",
+                        f"{fmt_money(worst['pnl'])} · {worst['date'].strftime('%-m/%-d')}" if worst is not None else "—",
+                        (P["green"] if worst["pnl"] >= 0 else P["red"]) if worst is not None else "",
+                    ),
+                ]
+            ),
+            unsafe_allow_html=True,
         )
-        st.markdown(render_calendar(year, month, daily, P), unsafe_allow_html=True)
-    with right:
-        st.markdown("#### Weekly")
-        for w in weekly_summary(year, month, daily):
-            color = P["green"] if w["pnl"] >= 0 else P["red"]
-            st.markdown(
-                f"<div style='border:1px solid {P['border']};border-radius:12px;"
-                f"background:{P['panel']};padding:11px 14px;margin-bottom:9px;"
-                f"box-shadow:{P['shadow']};'>"
-                f"<div style='font-size:12px;color:{P['muted']};font-weight:600;'>Week {w['week']}</div>"
-                f"<div style='font-size:21px;font-weight:700;color:{color};"
-                f"font-variant-numeric:tabular-nums;margin:2px 0 6px;'>{fmt_money(w['pnl'])}</div>"
-                f"<span style='font-size:11px;color:{P['muted']};background:{P['pill_bg']};"
-                f"border-radius:20px;padding:2px 10px;'>{w['days']} day"
-                f"{'s' if w['days']!=1 else ''}</span></div>",
-                unsafe_allow_html=True,
+
+        # ---- Calendar + weekly rail -------------------------------------------
+        left, right = st.columns([4, 1])
+        with left:
+            st.markdown(f"#### {calendar.month_name[month]} {year}")
+            st.caption(
+                "Figures are **realized P&L**, booked on the day a trade is *closed* "
+                "(matches Robinhood's **Realized profit & loss** page). This won't equal "
+                "the home-screen **\"Today\"** number, which marks open positions to "
+                "market — they differ only when a position is held overnight."
+            )
+            st.markdown(render_calendar(year, month, daily, P), unsafe_allow_html=True)
+        with right:
+            st.markdown("#### Weekly")
+            for w in weekly_summary(year, month, daily):
+                color = P["green"] if w["pnl"] >= 0 else P["red"]
+                st.markdown(
+                    f"<div style='border:1px solid {P['border']};border-radius:12px;"
+                    f"background:{P['panel']};padding:11px 14px;margin-bottom:9px;"
+                    f"box-shadow:{P['shadow']};'>"
+                    f"<div style='font-size:12px;color:{P['muted']};font-weight:600;'>Week {w['week']}</div>"
+                    f"<div style='font-size:21px;font-weight:700;color:{color};"
+                    f"font-variant-numeric:tabular-nums;margin:2px 0 6px;'>{fmt_money(w['pnl'])}</div>"
+                    f"<span style='font-size:11px;color:{P['muted']};background:{P['pill_bg']};"
+                    f"border-radius:20px;padding:2px 10px;'>{w['days']} day"
+                    f"{'s' if w['days']!=1 else ''}</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.divider()
+
+        # ---- Equity curve ------------------------------------------------------
+        st.markdown("#### Cumulative P&L (selected month)")
+        curve = mdaily.copy()
+        curve["cumulative"] = curve["pnl"].cumsum()
+        st.line_chart(curve.set_index("date")["cumulative"], height=260, color=P["accent"])
+
+        # ---- Detail table ------------------------------------------------------
+        with st.expander("📋 Daily detail"):
+            show = mdaily.copy()
+            show["date"] = show["date"].dt.strftime("%a %m/%d")
+            show = show.rename(
+                columns={
+                    "date": "Date",
+                    "pnl": "P&L ($)",
+                    "trades": "Trades",
+                    "wins": "Wins",
+                    "win_rate": "Win %",
+                }
+            )[["Date", "P&L ($)", "Trades", "Wins", "Win %"]]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+            csv = mdaily.assign(date=mdaily["date"].dt.strftime("%Y-%m-%d")).to_csv(index=False)
+            st.download_button(
+                "⬇️ Download this month's journal (CSV)",
+                csv,
+                file_name=f"journal_{year}_{month:02d}.csv",
+                mime="text/csv",
             )
 
-    st.divider()
 
-    # ---- Equity curve ------------------------------------------------------
-    st.markdown("#### Cumulative P&L (selected month)")
-    curve = mdaily.copy()
-    curve["cumulative"] = curve["pnl"].cumsum()
-    st.line_chart(curve.set_index("date")["cumulative"], height=260, color=P["accent"])
-
-    # ---- Detail table ------------------------------------------------------
-    with st.expander("📋 Daily detail"):
-        show = mdaily.copy()
-        show["date"] = show["date"].dt.strftime("%a %m/%d")
-        show = show.rename(
-            columns={
-                "date": "Date",
-                "pnl": "P&L ($)",
-                "trades": "Trades",
-                "wins": "Wins",
-                "win_rate": "Win %",
-            }
-        )[["Date", "P&L ($)", "Trades", "Wins", "Win %"]]
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-        csv = mdaily.assign(date=mdaily["date"].dt.strftime("%Y-%m-%d")).to_csv(index=False)
-        st.download_button(
-            "⬇️ Download this month's journal (CSV)",
-            csv,
-            file_name=f"journal_{year}_{month:02d}.csv",
-            mime="text/csv",
-        )
-
+    with tab_an:
+        render_analytics(build_trade_log(trades), daily, P)
 
 # --------------------------------------------------------------------------- #
 if not check_password():
