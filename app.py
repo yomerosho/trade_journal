@@ -349,6 +349,11 @@ def build_journal(trades: pd.DataFrame) -> pd.DataFrame:
     t = trades.copy()
     t["quantity"] = pd.to_numeric(t["quantity"], errors="coerce").fillna(0.0)
     t["amount"] = pd.to_numeric(t["amount"], errors="coerce").fillna(0.0)
+    # Robinhood labels expiries "Option Expiration for SPY 10/1/2026 Call $770.00";
+    # strip the prefix so the OEXP row groups with the contract it expires.
+    t["description"] = t["description"].astype(str).str.replace(
+        r"^Option Expiration for\s+", "", regex=True
+    )
     t = t.sort_values("date", kind="stable")
 
     rows = []  # (date, realized_pnl) per contract-day that had a realized close
