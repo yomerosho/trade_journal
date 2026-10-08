@@ -81,7 +81,7 @@ DARK = {
 
 
 def get_palette() -> dict:
-    return DARK if st.session_state.get("theme") == "Dark" else LIGHT
+    return LIGHT if st.session_state.get("theme", "Dark") == "Light" else DARK
 
 
 def global_css(P: dict) -> str:
@@ -101,6 +101,50 @@ def global_css(P: dict) -> str:
       border:1px solid {P['border']}; border-radius:12px; background:{P['panel']};
   }}
   hr {{ border-color:{P['border']}; }}
+  /* Native widgets keep Streamlit's own (light) styling unless overridden,
+     which left white buttons/uploader under the dark theme's light text. */
+  button[data-testid="stBaseButton-secondary"] {{
+      background:{P['panel']}; color:{P['text']}; border:1px solid {P['border']};
+  }}
+  button[data-testid="stBaseButton-secondary"]:hover {{
+      border-color:{P['accent']}; color:{P['accent']};
+  }}
+  button[data-testid="stBaseButton-secondary"] p {{ color:inherit; }}
+  section[data-testid="stFileUploaderDropzone"] {{
+      background:{P['panel']}; border:1px dashed {P['border']};
+  }}
+  [data-testid="stFileUploaderDropzoneInstructions"] span,
+  [data-testid="stFileUploaderDropzoneInstructions"] small {{
+      color:{P['muted']};
+  }}
+  [data-testid="stNumberInputContainer"], [data-testid="stNumberInput"] input,
+  [data-testid="stTextInput"] input {{
+      background:{P['input_bg']}; color:{P['text']}; border-color:{P['border']};
+  }}
+  [data-testid="stNumberInput"] button {{ background:{P['panel_2']}; color:{P['text']}; }}
+  /* selectbox control + dropdown (newer Streamlit markup, then BaseWeb) */
+  [data-testid="stSelectbox"] div[role="group"],
+  [data-testid="stSelectbox"] div[data-baseweb="select"] > div {{
+      background:{P['input_bg']}; border-color:{P['border']}; color:{P['text']};
+  }}
+  [data-testid="stSelectboxVirtualDropdown"],
+  div[data-baseweb="popover"] ul, div[data-baseweb="popover"] li {{
+      background:{P['panel']}; color:{P['text']};
+  }}
+  [data-testid="stSelectbox"] div[role="group"] input,
+  [data-testid="stSelectbox"] div[role="group"] svg {{
+      color:{P['text']}; -webkit-text-fill-color:{P['text']};
+  }}
+  [data-testid="stSelectboxVirtualDropdown"] [role="option"] {{ color:{P['text']}; }}
+  [data-testid="stSelectboxVirtualDropdown"] [role="option"]:hover,
+  [data-testid="stSelectboxVirtualDropdown"] [role="option"][aria-selected="true"],
+  div[data-baseweb="popover"] li:hover, div[data-baseweb="popover"] li[aria-selected="true"] {{
+      background:{P['panel_2']};
+  }}
+  header[data-testid="stHeader"] {{ background:{P['app_bg']}; }}
+  [data-testid="stBaseButton-headerNoPadding"], [data-testid="stMainMenu"] button {{
+      color:{P['muted']};
+  }}
   /* Summary strip */
   .gex-strip {{
       display:flex; flex-wrap:wrap; gap:0; background:{P['panel']};
@@ -157,6 +201,7 @@ def check_password() -> bool:
         return True
 
     # Login screen
+    st.markdown(global_css(get_palette()), unsafe_allow_html=True)
     st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1, 1.2, 1])
     with c2:
@@ -887,6 +932,7 @@ def main():
         st.radio(
             "Theme",
             ["Light", "Dark"],
+            index=1,
             key="theme",
             horizontal=True,
         )
