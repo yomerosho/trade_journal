@@ -17,6 +17,11 @@ journal updates instantly.
 - **Weekly summary** — P&L per calendar week
 - **Equity curve** — cumulative P&L across the month
 - **Daily detail table** — exportable as a clean journal CSV
+- **Analytics tab** — year-to-date (or all-time) performance: profit factor,
+  drawdown, monthly breakdown, results by entry style (single price vs. adding),
+  by entry order within the day, by day of week (with a month × weekday heatmap),
+  by trades per day, by ticker (calls/puts, single vs. multi-price entries), and
+  the biggest wins and losses
 
 ### How P&L is calculated
 
